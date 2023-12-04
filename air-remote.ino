@@ -21,9 +21,6 @@ void setup() {
   pinMode(PIN_LED, OUTPUT);
 
   Serial.begin(115200);
-  while (!Serial) {
-    delay(10);
-  }
 
   Wire.begin(0x05);
   Wire.onReceive(dataReceived);
@@ -40,14 +37,14 @@ void dataReceived(int numBytes) {
 	while(Wire.available()) {
 		char c = Wire.read();
 	}
-  led = !led;
-  digitalWrite(PIN_LED, led ? HIGH : LOW);
 }
 
 unsigned long last_request = 0;
 
 void dataRequested() {
   if (millis() - last_request > 3000) {
+    led = !led;
+    digitalWrite(PIN_LED, led ? HIGH : LOW);
 	  Wire.write("PONGILY PING");
     last_request = millis();
   } else {
@@ -55,14 +52,112 @@ void dataRequested() {
   }
 }
 
-uint8_t fifoBuf[64];
+uint8_t fifo_buf[64];
 
 void loop() {
-  uint32_t msgLen = rp2040.fifo.pop();
-  for (size_t pos = 0; pos < msgLen; ++pos) {
-    fifoBuf[pos] = rp2040.fifo.pop();
+  uint32_t itf_protocol = rp2040.fifo.pop();
+  uint32_t msg_len = rp2040.fifo.pop();
+  for (size_t pos = 0; pos < msg_len; ++pos) {
+    fifo_buf[pos] = rp2040.fifo.pop();
   }
-  Serial.printf("GOT %u BYTES\n", msgLen);
+  handle_usb_input(itf_protocol, msg_len, fifo_buf);
+}
+
+unsigned long mouse_button_last = 0;
+unsigned long lower_left_button_last = 0;
+
+bool ok_button_pressed = false;
+
+const int MOUSE_MOVE_THRESHOLD = 180;
+
+void handle_usb_input(uint32_t itf_protocol, uint32_t len, uint8_t* report) {
+  if (itf_protocol == HID_ITF_PROTOCOL_KEYBOARD) {
+    if (len != 8) {
+      Serial.printf("report len = %u NOT 8, probably something wrong !!\r\n", len);
+    } else if (report[2] == 0x65) {
+      Serial.println("LOWER LEFT KEY");
+      lower_left_button_last = millis();
+    } else {
+      if (report[2] == 0x00) {
+        Serial.println("KB RELEASE");
+        if (lower_left_button_last > 0) {
+          if (usb_hid.ready()) {
+            Serial.println("PLAY/PAUSE");
+            usb_hid.sendReport16(RID_CONSUMER_CONTROL, HID_USAGE_CONSUMER_PLAY_PAUSE);
+            delay(5);
+            usb_hid.sendReport16(RID_CONSUMER_CONTROL, 0);
+          }
+          lower_left_button_last = 0;
+        }
+      } else {
+        for (uint16_t i = 0; i < len; i++) {
+          Serial.printf("0x%02X ", report[i]);
+        }
+        Serial.println("KB");
+      }
+
+      if (usb_hid.ready()) {
+        usb_hid.sendReport(RID_KEYBOARD, report, sizeof(hid_keyboard_report_t));
+      }
+    }
+  } else {
+    // Mouse events
+    // 0x04 (1 if OK pressed) (X) (Y) 0x00
+    if (report[0] == 0x04) {
+      hid_mouse_report_t new_report;
+      new_report.buttons = report[1];
+      new_report.x = report[2];
+      new_report.y = report[3];
+      new_report.wheel = 0;
+      new_report.pan = 0;
+
+      if (mouse_button_last > 0 && millis() - mouse_button_last > MOUSE_MOVE_THRESHOLD) {
+        if (usb_hid.ready()) {
+          usb_hid.sendReport(RID_MOUSE, &new_report, sizeof(new_report));
+        }
+      } else if (report[1]) {
+        if (!ok_button_pressed) {
+          Serial.println("OK BTN PRESS");
+        }
+      }
+
+      ok_button_pressed = report[1] > 0;
+    } else if (report[0] == 0x01) {
+      if (report[1] == 0x00) {
+        Serial.println("RELEASE");
+        if (mouse_button_last > 0) {
+          if (millis() - mouse_button_last < MOUSE_MOVE_THRESHOLD) {
+            Serial.println("MOUSE BUTTON");
+            hid_mouse_report_t new_report;
+            new_report.buttons = 1;
+            new_report.x = 0;
+            new_report.y = 0;
+            new_report.wheel = 0;
+            new_report.pan = 0;
+
+            if (usb_hid.ready()) {
+              usb_hid.sendReport(RID_MOUSE, &new_report, sizeof(new_report));
+              delay(5);
+              new_report.buttons = 0;
+              usb_hid.sendReport(RID_MOUSE, &new_report, sizeof(new_report));
+            }
+          }
+          mouse_button_last = 0;
+        }
+      } else if (report[1] == 0x23) {
+        Serial.println("UPPER RIGHT");
+        mouse_button_last = millis();
+      } else if (report[1] == 0x24) {
+        Serial.println("LOWER RIGHT");
+      } else if (report[1] == 0xEA) {
+        Serial.println("VOL DOWN");
+       } else if (report[1] == 0xE9) {
+        Serial.println("VOL UP");
+      } else {
+        Serial.println("!!! UNKNOWN");
+      }
+    }
+  }
 }
 
 //------------- Core1 -------------//
@@ -111,119 +206,18 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance) {
   Serial.printf("HID device address = %d, instance = %d is unmounted\r\n", dev_addr, instance);
 }
 
-unsigned long mouse_button_last = 0;
-unsigned long lower_left_button_last = 0;
-bool ok_button_pressed = false;
-
-const int MOUSE_MOVE_THRESHOLD = 180;
-
 // Invoked when received report from device via interrupt endpoint
 void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t const *report, uint16_t len) {
+  uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
+  rp2040.fifo.push(itf_protocol);
   rp2040.fifo.push(len);
   for (size_t pos = 0; pos < len; ++pos) {
     rp2040.fifo.push(report[pos]);
   }
 
-  uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
-  if (itf_protocol == HID_ITF_PROTOCOL_KEYBOARD) {
-    if (len != 8) {
-      Serial.printf("report len = %u NOT 8, probably something wrong !!\r\n", len);
-    } else if (report[2] == 0x65) {
-      Serial.println("LOWER LEFT KEY");
-      lower_left_button_last = millis();
-    } else {
-      if (report[2] == 0x00) {
-        Serial.println("KB RELEASE");
-        if (lower_left_button_last > 0) {
-          // while (!usb_hid.ready()) {
-          //   yield();
-          // }
-          // Serial.println("PLAY/PAUSE");
-          // usb_hid.sendReport16(RID_CONSUMER_CONTROL, HID_USAGE_CONSUMER_PLAY_PAUSE);
-          // delay(5);
-          // usb_hid.sendReport16(RID_CONSUMER_CONTROL, 0);
-          lower_left_button_last = 0;
-        }
-      } else {
-        for (uint16_t i = 0; i < len; i++) {
-          Serial.printf("0x%02X ", report[i]);
-        }
-        Serial.println("KB");
-      }
-
-      // NOTE: for better performance you should save/queue remapped report instead of
-      // blocking wait for usb_hid ready here
-      // while (!usb_hid.ready()) {
-      //   yield();
-      // }
-
-      // usb_hid.sendReport(RID_KEYBOARD, report, sizeof(hid_keyboard_report_t));
-    }
-  } else {
-    // Mouse events
-    // 0x04 (1 if OK pressed) (X) (Y) 0x00
-    if (report[0] == 0x04) {
-      hid_mouse_report_t new_report;
-      new_report.buttons = report[1];
-      new_report.x = report[2];
-      new_report.y = report[3];
-      new_report.wheel = 0;
-      new_report.pan = 0;
-
-      if (mouse_button_last > 0 && millis() - mouse_button_last > MOUSE_MOVE_THRESHOLD) {
-        // while (!usb_hid.ready()) {
-        //   yield();
-        // }
-        // usb_hid.sendReport(RID_MOUSE, &new_report, sizeof(new_report));
-      } else if (report[1]) {
-        if (!ok_button_pressed) {
-          Serial.println("OK BTN PRESS");
-        }
-      }
-
-      ok_button_pressed = report[1] > 0;
-    } else if (report[0] == 0x01) {
-      if (report[1] == 0x00) {
-        Serial.println("RELEASE");
-        if (mouse_button_last > 0) {
-          if (millis() - mouse_button_last < MOUSE_MOVE_THRESHOLD) {
-            Serial.println("MOUSE BUTTON");
-            hid_mouse_report_t new_report;
-            new_report.buttons = 1;
-            new_report.x = 0;
-            new_report.y = 0;
-            new_report.wheel = 0;
-            new_report.pan = 0;
-
-            // while (!usb_hid.ready()) {
-            //   yield();
-            // }
-
-            // usb_hid.sendReport(RID_MOUSE, &new_report, sizeof(new_report));
-            // delay(5);
-            // new_report.buttons = 0;
-            // usb_hid.sendReport(RID_MOUSE, &new_report, sizeof(new_report));
-          }
-          mouse_button_last = 0;
-        }
-      } else if (report[1] == 0x23) {
-        Serial.println("UPPER RIGHT");
-        mouse_button_last = millis();
-      } else if (report[1] == 0x24) {
-        Serial.println("LOWER RIGHT");
-      } else if (report[1] == 0xEA) {
-        Serial.println("VOL DOWN");
-       } else if (report[1] == 0xE9) {
-        Serial.println("VOL UP");
-      } else {
-        Serial.println("!!! UNKNOWN");
-      }
-    } 
-  }
-
   // continue to request to receive report
   if (!tuh_hid_receive_report(dev_addr, instance)) {
-    Serial.printf("Error: cannot request to receive report\r\n");
+    Serial.println("Error: cannot request to receive report");
   }
 }
 
