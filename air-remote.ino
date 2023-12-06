@@ -1,4 +1,6 @@
 #include <Wire.h>
+#include <CircularBuffer.h>
+
 #include "usb.h"
 
 enum
@@ -17,6 +19,41 @@ uint8_t const desc_hid_report[] =
 
 Adafruit_USBD_HID usb_hid;
 
+bool passthru = true;
+
+// Disable passthru while the TV input menu is presumably open
+unsigned long inputs_menu_start = 0;
+
+// Disable passthru right after we open the TV home menu
+unsigned long home_menu_start = 0;
+
+struct InputEvent {
+  uint8_t kind;
+  uint8_t data;
+};
+
+CircularBuffer<InputEvent, 16> input_events;
+
+bool isPassthru() {
+  if (inputs_menu_start != 0) {
+    if (millis() - inputs_menu_start < 4000) {
+      return false;
+    } else {
+      inputs_menu_start = 0;
+    }
+  }
+
+  if (home_menu_start != 0) {
+    if (millis() - home_menu_start < 5000) {
+      return false;
+    } else {
+      home_menu_start = 0;
+    }
+  }
+
+  return passthru && usb_hid.ready();
+}
+
 void setup() {
   pinMode(PIN_LED, OUTPUT);
 
@@ -31,72 +68,130 @@ void setup() {
   usb_hid.begin();
 }
 
-bool led = false;
-
 void dataReceived(int numBytes) {
 	while(Wire.available()) {
-		char c = Wire.read();
+    uint8_t byte = Wire.read();
+
+    if (byte == 'p') {
+      // Lowercase p: passthru off
+      passthru = false;
+    } else if (byte == 'P') {
+      // Uppercase P: passthru on
+      passthru = true;
+    }
 	}
 }
 
-unsigned long last_request = 0;
-
 void dataRequested() {
-  if (millis() - last_request > 3000) {
-    led = !led;
-    digitalWrite(PIN_LED, led ? HIGH : LOW);
-	  Wire.write("PONGILY PING");
-    last_request = millis();
+  if (!input_events.isEmpty()) {
+    InputEvent event = input_events.pop();
+    Wire.write(event.kind);
+    Wire.write(event.data);
   } else {
-    Wire.write("nope");
+    Wire.write(0);
+    Wire.write(0);
   }
 }
 
 uint8_t fifo_buf[64];
 
 void loop() {
-  uint32_t itf_protocol = rp2040.fifo.pop();
-  uint32_t msg_len = rp2040.fifo.pop();
-  for (size_t pos = 0; pos < msg_len; ++pos) {
-    fifo_buf[pos] = rp2040.fifo.pop();
+  digitalWrite(PIN_LED, isPassthru() ? HIGH : LOW);
+
+  if (rp2040.fifo.available() >= 2) {
+    uint32_t itf_protocol = rp2040.fifo.pop();
+    uint32_t msg_len = rp2040.fifo.pop();
+    for (size_t pos = 0; pos < msg_len; ++pos) {
+      fifo_buf[pos] = rp2040.fifo.pop();
+    }
+    handle_usb_input(itf_protocol, msg_len, fifo_buf);
+  } else {
+    handle_usb_input(0, 0, NULL);
   }
-  handle_usb_input(itf_protocol, msg_len, fifo_buf);
+
+  delay(10);
 }
 
-unsigned long mouse_button_last = 0;
-unsigned long lower_left_button_last = 0;
+void xfer_key_press(bool shift, uint8_t scan_code) {
+  // TODO: ASCIIfication
+  Serial.println(shift ? "SHIFT" : "NOSHIFT");
+  input_events.unshift(InputEvent{ .kind = 'K', .data = scan_code});
+}
 
 bool ok_button_pressed = false;
+bool key_press_active = false;
+unsigned long mouse_button_last = 0;
+unsigned long lower_left_button_last = 0;
+unsigned long lower_right_button_last = 0;
 
+const int BUTTON_HOLD_THRESHOLD = 400;
 const int MOUSE_MOVE_THRESHOLD = 180;
+const uint8_t HID_USAGE_CONSUMER_MENU_ESCAPE = 0x46;
+const uint8_t HID_USAGE_CONSUMER_CHANNEL = 0x86;
+const uint8_t HID_USAGE_CONSUMER_MEDIA_SELECT_HOME = 0x9A;
 
 void handle_usb_input(uint32_t itf_protocol, uint32_t len, uint8_t* report) {
+  if (len == 0) {
+    // Periodic tick check, not actually input
+
+    if (lower_left_button_last > 0 && millis() - lower_left_button_last >= BUTTON_HOLD_THRESHOLD) {
+      input_events.unshift(InputEvent{ .kind = 'C', .data = HID_USAGE_CONSUMER_MENU_ESCAPE});
+      lower_left_button_last = 0;
+    }
+
+    if (lower_right_button_last > 0 && millis() - lower_right_button_last >= BUTTON_HOLD_THRESHOLD) {
+      input_events.unshift(InputEvent{ .kind = 'C', .data = HID_USAGE_CONSUMER_MEDIA_SELECT_HOME});
+      lower_right_button_last = 0;
+      home_menu_start = millis();
+    }
+
+    return;
+  }
+
   if (itf_protocol == HID_ITF_PROTOCOL_KEYBOARD) {
     if (len != 8) {
       Serial.printf("report len = %u NOT 8, probably something wrong !!\r\n", len);
     } else if (report[2] == 0x65) {
-      Serial.println("LOWER LEFT KEY");
+      // Lower left key
       lower_left_button_last = millis();
-    } else {
-      if (report[2] == 0x00) {
-        Serial.println("KB RELEASE");
-        if (lower_left_button_last > 0) {
-          if (usb_hid.ready()) {
-            Serial.println("PLAY/PAUSE");
+    } else if (report[2] == 0x00) {
+      // Key release
+      key_press_active = false;
+
+      if (lower_left_button_last > 0) {
+        if (millis() - lower_left_button_last < BUTTON_HOLD_THRESHOLD) {
+          input_events.unshift(InputEvent{ .kind = 'C', .data = HID_USAGE_CONSUMER_PLAY_PAUSE});
+          if (isPassthru()) {
             usb_hid.sendReport16(RID_CONSUMER_CONTROL, HID_USAGE_CONSUMER_PLAY_PAUSE);
             delay(5);
             usb_hid.sendReport16(RID_CONSUMER_CONTROL, 0);
           }
-          lower_left_button_last = 0;
         }
-      } else {
-        for (uint16_t i = 0; i < len; i++) {
-          Serial.printf("0x%02X ", report[i]);
-        }
-        Serial.println("KB");
+        lower_left_button_last = 0;
       }
 
+      // Don't check passthru; always allow a key release report through, to prevent stuck keys
       if (usb_hid.ready()) {
+        usb_hid.sendReport(RID_KEYBOARD, report, sizeof(hid_keyboard_report_t));
+      }
+    } else {
+      // Key press
+      if (!key_press_active) {
+        key_press_active = true;
+        xfer_key_press(report[0] == 2, report[2]);
+
+        if (inputs_menu_start > 0) {
+          if (report[2] == 0x51 || report[2] == 0x52) {
+            // Up and down keys reset the inputs menu timeout
+            inputs_menu_start = millis();
+          } else if (report[2] == 0x4F || report[2] == 0x50) {
+            // Left and right keys close the input menu
+            inputs_menu_start = 0;
+          }
+        }
+      }
+
+      if (isPassthru()) {
         usb_hid.sendReport(RID_KEYBOARD, report, sizeof(hid_keyboard_report_t));
       }
     }
@@ -104,38 +199,40 @@ void handle_usb_input(uint32_t itf_protocol, uint32_t len, uint8_t* report) {
     // Mouse events
     // 0x04 (1 if OK pressed) (X) (Y) 0x00
     if (report[0] == 0x04) {
-      hid_mouse_report_t new_report;
-      new_report.buttons = report[1];
-      new_report.x = report[2];
-      new_report.y = report[3];
-      new_report.wheel = 0;
-      new_report.pan = 0;
-
       if (mouse_button_last > 0 && millis() - mouse_button_last > MOUSE_MOVE_THRESHOLD) {
-        if (usb_hid.ready()) {
+        // Mouse movement
+        if (isPassthru()) {
+          hid_mouse_report_t new_report;
+          new_report.buttons = report[1];
+          new_report.x = report[2];
+          new_report.y = report[3];
+          new_report.wheel = 0;
+          new_report.pan = 0;
           usb_hid.sendReport(RID_MOUSE, &new_report, sizeof(new_report));
         }
       } else if (report[1]) {
         if (!ok_button_pressed) {
-          Serial.println("OK BTN PRESS");
+          // OK button pressed
+          input_events.unshift(InputEvent{ .kind = 'O', .data = 1});
+          inputs_menu_start = 0; // Pressing OK selects an input
         }
       }
-
       ok_button_pressed = report[1] > 0;
     } else if (report[0] == 0x01) {
+      // Consumer events
       if (report[1] == 0x00) {
-        Serial.println("RELEASE");
+        // Consumer release
         if (mouse_button_last > 0) {
           if (millis() - mouse_button_last < MOUSE_MOVE_THRESHOLD) {
-            Serial.println("MOUSE BUTTON");
-            hid_mouse_report_t new_report;
-            new_report.buttons = 1;
-            new_report.x = 0;
-            new_report.y = 0;
-            new_report.wheel = 0;
-            new_report.pan = 0;
+            // Mouse click
+            if (isPassthru()) {
+              hid_mouse_report_t new_report;
+              new_report.buttons = 1;
+              new_report.x = 0;
+              new_report.y = 0;
+              new_report.wheel = 0;
+              new_report.pan = 0;
 
-            if (usb_hid.ready()) {
               usb_hid.sendReport(RID_MOUSE, &new_report, sizeof(new_report));
               delay(5);
               new_report.buttons = 0;
@@ -144,17 +241,29 @@ void handle_usb_input(uint32_t itf_protocol, uint32_t len, uint8_t* report) {
           }
           mouse_button_last = 0;
         }
+
+        if (lower_right_button_last > 0) {
+          if (millis() - lower_right_button_last < BUTTON_HOLD_THRESHOLD) {
+            input_events.unshift(InputEvent{ .kind = 'C', .data = HID_USAGE_CONSUMER_CHANNEL});
+            if (inputs_menu_start == 0) {
+              inputs_menu_start = millis();
+            } else {
+              inputs_menu_start = 0; // Pressing input again closes the input menu
+            }
+
+          }
+          lower_right_button_last = 0;
+        }
       } else if (report[1] == 0x23) {
-        Serial.println("UPPER RIGHT");
+        // Upper right button
         mouse_button_last = millis();
       } else if (report[1] == 0x24) {
-        Serial.println("LOWER RIGHT");
-      } else if (report[1] == 0xEA) {
-        Serial.println("VOL DOWN");
-       } else if (report[1] == 0xE9) {
-        Serial.println("VOL UP");
+        // Lower right butotn
+        lower_right_button_last = millis();
       } else {
-        Serial.println("!!! UNKNOWN");
+        // 0xEA: Volume down
+        // 0xE9: Volume up
+        input_events.unshift(InputEvent{ .kind = 'C', .data = report[1] });
       }
     }
   }
@@ -181,29 +290,12 @@ void loop1() {
 extern "C"
 {
 
-// Invoked when device with hid interface is mounted
-// Report descriptor is also available for use.
-// tuh_hid_parse_report_descriptor() can be used to parse common/simple enough
-// descriptor. Note: if report descriptor length > CFG_TUH_ENUMERATION_BUFSIZE,
-// it will be skipped therefore report_desc = NULL, desc_len = 0
 void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const *desc_report, uint16_t desc_len) {
-  (void) desc_report;
-  (void) desc_len;
-  uint16_t vid, pid;
-  tuh_vid_pid_get(dev_addr, &vid, &pid);
-
-  Serial.printf("HID device address = %d, instance = %d is mounted\r\n", dev_addr, instance);
-  Serial.printf("VID = %04x, PID = %04x\r\n", vid, pid);
-  if (tuh_hid_receive_report(dev_addr, instance)) {
-    Serial.printf("Registered\r\n");
-  } else {
-    Serial.printf("Error: cannot request to receive report\r\n");
-  }
+  tuh_hid_receive_report(dev_addr, instance);
 }
 
-// Invoked when device with hid interface is un-mounted
 void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance) {
-  Serial.printf("HID device address = %d, instance = %d is unmounted\r\n", dev_addr, instance);
+  //Serial.printf("HID device address = %d, instance = %d is unmounted\r\n", dev_addr, instance);
 }
 
 // Invoked when received report from device via interrupt endpoint
