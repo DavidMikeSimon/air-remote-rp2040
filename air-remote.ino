@@ -121,7 +121,6 @@ const char* HID_CHAR_MAP_SHIFT_OFF = "abcdefghijklmnopqrstuvwxyz1234567890" "\x0
 const char* HID_CHAR_MAP_SHIFT_ON  =  "ABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()" "\x0A\x1B\x08\x09" " _+{}|"  "X" ":\"" "~<>?";
 
 void xfer_key_press(bool shift, uint8_t scan_code) {
-  Serial.printf("SHIFT %u  SCAN CODE %02x\n", shift, scan_code);
   if (scan_code >= HID_KEY_A && scan_code <= HID_KEY_SLASH ) {
     char c = (shift ? HID_CHAR_MAP_SHIFT_ON : HID_CHAR_MAP_SHIFT_OFF)[scan_code - HID_KEY_A];
     input_events.unshift(InputEvent{ .kind = 'A', .data = c});
@@ -139,11 +138,9 @@ unsigned long lower_right_button_last = 0;
 const int BUTTON_HOLD_THRESHOLD = 400;
 const int MOUSE_MOVE_THRESHOLD = 180;
 
-
 void handle_usb_input(uint32_t itf_protocol, uint32_t len, uint8_t* report) {
   if (len == 0) {
     // Periodic tick check, not actually input
-
     if (lower_left_button_last > 0 && millis() - lower_left_button_last >= BUTTON_HOLD_THRESHOLD) {
       input_events.unshift(InputEvent{ .kind = 'C', .data = HID_USAGE_CONSUMER_MENU_ESCAPE});
       lower_left_button_last = 0;
@@ -254,26 +251,44 @@ void handle_usb_input(uint32_t itf_protocol, uint32_t len, uint8_t* report) {
           }
         }
         mouse_button_last = 0;
-      }
-
-      if (lower_right_button_last > 0) {
-        if (millis() - lower_right_button_last < BUTTON_HOLD_THRESHOLD) {
-          input_events.unshift(InputEvent{ .kind = 'C', .data = HID_USAGE_CONSUMER_CHANNEL});
-          if (inputs_menu_start == 0) {
-            inputs_menu_start = millis();
-          } else {
-            inputs_menu_start = 0; // Pressing input again closes the input menu
-          }
-
-        }
         lower_right_button_last = 0;
+      } else {
+        if (lower_right_button_last > 0) {
+          if (millis() - lower_right_button_last < BUTTON_HOLD_THRESHOLD) {
+            input_events.unshift(InputEvent{ .kind = 'C', .data = HID_USAGE_CONSUMER_CHANNEL});
+            if (inputs_menu_start == 0) {
+              inputs_menu_start = millis();
+            } else {
+              inputs_menu_start = 0; // Pressing input again closes the input menu
+            }
+
+          }
+          lower_right_button_last = 0;
+        }
       }
     } else if (report[1] == 0x23) {
       // Upper right button
       mouse_button_last = millis();
     } else if (report[1] == 0x24) {
-      // Lower right butotn
-      lower_right_button_last = millis();
+      // Lower right button
+      if (mouse_button_last > 0) {
+        // Mouse right-click
+        if (isPassthru()) {
+          hid_mouse_report_t new_report;
+          new_report.buttons = 2;
+          new_report.x = 0;
+          new_report.y = 0;
+          new_report.wheel = 0;
+          new_report.pan = 0;
+
+          usb_hid.sendReport(RID_MOUSE, &new_report, sizeof(new_report));
+          delay(5);
+          new_report.buttons = 0;
+          usb_hid.sendReport(RID_MOUSE, &new_report, sizeof(new_report));
+        }
+      } else {
+        lower_right_button_last = millis();
+      }
     } else {
       // 0xEA: Volume down
       // 0xE9: Volume up
