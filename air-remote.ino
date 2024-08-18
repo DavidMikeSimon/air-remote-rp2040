@@ -163,7 +163,6 @@ void handle_usb_input(uint32_t itf_protocol, uint32_t len, uint8_t* report) {
     if (volume_up_last > 0) {
       unsigned long mark = volume_up_holding_sent_last > 0 ? volume_up_holding_sent_last : volume_up_last;
       if (millis() - mark > VOLUME_SEND_INTERVAL) {
-        Serial.println("HOLD VOLUME UP");
         input_events.unshift(InputEvent{ .kind = 'C', .data = HID_USAGE_CONSUMER_VOLUME_UP});
         volume_up_holding_sent_last = millis();
       }
@@ -172,12 +171,10 @@ void handle_usb_input(uint32_t itf_protocol, uint32_t len, uint8_t* report) {
     if (volume_down_last > 0) {
       unsigned long mark = volume_down_holding_sent_last > 0 ? volume_down_holding_sent_last : volume_down_last;
       if (millis() - mark > VOLUME_SEND_INTERVAL) {
-        Serial.println("HOLD VOLUME DOWN");
         input_events.unshift(InputEvent{ .kind = 'C', .data = HID_USAGE_CONSUMER_VOLUME_DOWN});
         volume_down_holding_sent_last = millis();
       }
     }
-
 
     return;
   }
@@ -297,16 +294,18 @@ void handle_usb_input(uint32_t itf_protocol, uint32_t len, uint8_t* report) {
       if (volume_up_last > 0) {
         volume_up_last = 0;
         if (volume_up_holding_sent_last == 0) {
-          Serial.println("SINGLE VOLUME UP");
           input_events.unshift(InputEvent{ .kind = 'C', .data = HID_USAGE_CONSUMER_VOLUME_UP});
+        } else {
+          volume_up_holding_sent_last = 0;
         }
       }
 
       if (volume_down_last > 0) {
         volume_down_last = 0;
         if (volume_down_holding_sent_last == 0) {
-          Serial.println("SINGLE VOLUME DOWN");
           input_events.unshift(InputEvent{ .kind = 'C', .data = HID_USAGE_CONSUMER_VOLUME_DOWN});
+        } else {
+          volume_down_holding_sent_last = 0;
         }
       }
     } else if (report[1] == 0x23) {
