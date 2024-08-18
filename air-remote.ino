@@ -7,6 +7,8 @@
 #define HID_USAGE_CONSUMER_MENU_ESCAPE 0x46
 #define HID_USAGE_CONSUMER_CHANNEL 0x86
 #define HID_USAGE_CONSUMER_MEDIA_SELECT_HOME 0x9A
+#define HID_USAGE_CONSUMER_VOLUME_DOWN 0xEA
+#define HID_USAGE_CONSUMER_VOLUME_UP 0xE9
 
 enum
 {
@@ -19,7 +21,7 @@ uint8_t const desc_hid_report[] =
 {
   TUD_HID_REPORT_DESC_KEYBOARD( HID_REPORT_ID(RID_KEYBOARD) ),
   TUD_HID_REPORT_DESC_MOUSE   ( HID_REPORT_ID(RID_MOUSE) ),
-  TUD_HID_REPORT_DESC_CONSUMER( HID_REPORT_ID(RID_CONSUMER_CONTROL) )
+  TUD_HID_REPORT_DESC_CONSUMER( HID_REPORT_ID(RID_CONSUMER_CONTROL) ),
 };
 
 Adafruit_USBD_HID usb_hid;
@@ -134,9 +136,15 @@ bool key_press_active = false;
 unsigned long mouse_button_last = 0;
 unsigned long lower_left_button_last = 0;
 unsigned long lower_right_button_last = 0;
+unsigned long volume_down_last = 0;
+unsigned long volume_down_holding_sent_last = 0;
+unsigned long volume_up_last = 0;
+unsigned long volume_up_holding_sent_last = 0;
 
 const int BUTTON_HOLD_THRESHOLD = 400;
 const int MOUSE_MOVE_THRESHOLD = 180;
+const int VOLUME_SEND_INTERVAL = 500;
+const int SINGLE_PRESS_DELAY = 15;
 
 void handle_usb_input(uint32_t itf_protocol, uint32_t len, uint8_t* report) {
   if (len == 0) {
@@ -151,6 +159,25 @@ void handle_usb_input(uint32_t itf_protocol, uint32_t len, uint8_t* report) {
       lower_right_button_last = 0;
       home_menu_start = millis();
     }
+
+    if (volume_up_last > 0) {
+      unsigned long mark = volume_up_holding_sent_last > 0 ? volume_up_holding_sent_last : volume_up_last;
+      if (millis() - mark > VOLUME_SEND_INTERVAL) {
+        Serial.println("HOLD VOLUME UP");
+        input_events.unshift(InputEvent{ .kind = 'C', .data = HID_USAGE_CONSUMER_VOLUME_UP});
+        volume_up_holding_sent_last = millis();
+      }
+    }
+
+    if (volume_down_last > 0) {
+      unsigned long mark = volume_down_holding_sent_last > 0 ? volume_down_holding_sent_last : volume_down_last;
+      if (millis() - mark > VOLUME_SEND_INTERVAL) {
+        Serial.println("HOLD VOLUME DOWN");
+        input_events.unshift(InputEvent{ .kind = 'C', .data = HID_USAGE_CONSUMER_VOLUME_DOWN});
+        volume_down_holding_sent_last = millis();
+      }
+    }
+
 
     return;
   }
@@ -175,7 +202,7 @@ void handle_usb_input(uint32_t itf_protocol, uint32_t len, uint8_t* report) {
           input_events.unshift(InputEvent{ .kind = 'C', .data = HID_USAGE_CONSUMER_PLAY_PAUSE});
           if (isPassthru()) {
             usb_hid.sendReport16(RID_CONSUMER_CONTROL, HID_USAGE_CONSUMER_PLAY_PAUSE);
-            delay(5);
+            delay(SINGLE_PRESS_DELAY);
             usb_hid.sendReport16(RID_CONSUMER_CONTROL, 0);
           }
         }
@@ -245,7 +272,7 @@ void handle_usb_input(uint32_t itf_protocol, uint32_t len, uint8_t* report) {
             new_report.pan = 0;
 
             usb_hid.sendReport(RID_MOUSE, &new_report, sizeof(new_report));
-            delay(5);
+            delay(SINGLE_PRESS_DELAY);
             new_report.buttons = 0;
             usb_hid.sendReport(RID_MOUSE, &new_report, sizeof(new_report));
           }
@@ -266,6 +293,22 @@ void handle_usb_input(uint32_t itf_protocol, uint32_t len, uint8_t* report) {
           lower_right_button_last = 0;
         }
       }
+
+      if (volume_up_last > 0) {
+        volume_up_last = 0;
+        if (volume_up_holding_sent_last == 0) {
+          Serial.println("SINGLE VOLUME UP");
+          input_events.unshift(InputEvent{ .kind = 'C', .data = HID_USAGE_CONSUMER_VOLUME_UP});
+        }
+      }
+
+      if (volume_down_last > 0) {
+        volume_down_last = 0;
+        if (volume_down_holding_sent_last == 0) {
+          Serial.println("SINGLE VOLUME DOWN");
+          input_events.unshift(InputEvent{ .kind = 'C', .data = HID_USAGE_CONSUMER_VOLUME_DOWN});
+        }
+      }
     } else if (report[1] == 0x23) {
       // Upper right button
       mouse_button_last = millis();
@@ -282,17 +325,17 @@ void handle_usb_input(uint32_t itf_protocol, uint32_t len, uint8_t* report) {
           new_report.pan = 0;
 
           usb_hid.sendReport(RID_MOUSE, &new_report, sizeof(new_report));
-          delay(5);
+          delay(SINGLE_PRESS_DELAY);
           new_report.buttons = 0;
           usb_hid.sendReport(RID_MOUSE, &new_report, sizeof(new_report));
         }
       } else {
         lower_right_button_last = millis();
       }
-    } else {
-      // 0xEA: Volume down
-      // 0xE9: Volume up
-      input_events.unshift(InputEvent{ .kind = 'C', .data = report[1] });
+    } else if (report[1] == HID_USAGE_CONSUMER_VOLUME_DOWN) {
+      volume_down_last = millis();
+    } else if (report[1] == HID_USAGE_CONSUMER_VOLUME_UP) {
+      volume_up_last = millis();
     }
   }
 }
