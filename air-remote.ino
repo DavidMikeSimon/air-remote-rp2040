@@ -153,6 +153,10 @@ const int SINGLE_PRESS_DELAY = 15;
 const int MOUSE_WHEEL_SCROLL = 1;
 
 void mouse_wheel(bool up) {
+  if (!isPassthru()) {
+    return;
+  }
+  
   hid_mouse_report_t new_report;
   new_report.buttons = 0;
   new_report.x = 0;
