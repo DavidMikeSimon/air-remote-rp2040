@@ -120,7 +120,7 @@ void loop() {
 }
 
 const char* HID_CHAR_MAP_SHIFT_OFF = "abcdefghijklmnopqrstuvwxyz1234567890" "\x0A\x1B\x08\x09" " -=[]\\" "X" ";'"  "`,./";
-const char* HID_CHAR_MAP_SHIFT_ON  =  "ABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()" "\x0A\x1B\x08\x09" " _+{}|"  "X" ":\"" "~<>?";
+const char* HID_CHAR_MAP_SHIFT_ON  = "ABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()" "\x0A\x1B\x08\x09" " _+{}|"  "X" ":\"" "~<>?";
 
 void xfer_key_press(bool shift, uint8_t scan_code) {
   if (scan_code >= HID_KEY_A && scan_code <= HID_KEY_SLASH ) {
@@ -140,11 +140,31 @@ unsigned long volume_down_last = 0;
 unsigned long volume_down_holding_sent_last = 0;
 unsigned long volume_up_last = 0;
 unsigned long volume_up_holding_sent_last = 0;
+unsigned long scroll_up_last = 0;
+unsigned long scroll_up_holding_sent_last = 0;
+unsigned long scroll_down_last = 0;
+unsigned long scroll_down_holding_sent_last = 0;
 
 const int BUTTON_HOLD_THRESHOLD = 400;
 const int MOUSE_MOVE_THRESHOLD = 180;
-const int VOLUME_SEND_INTERVAL = 500;
+const int VOLUME_SEND_INTERVAL = 80;
+const int SCROLL_REPEAT_INTERVAL = 150;
 const int SINGLE_PRESS_DELAY = 15;
+const int MOUSE_WHEEL_SCROLL = 1;
+
+void mouse_wheel(bool up) {
+  hid_mouse_report_t new_report;
+  new_report.buttons = 0;
+  new_report.x = 0;
+  new_report.y = 0;
+  new_report.wheel = up ? MOUSE_WHEEL_SCROLL : -MOUSE_WHEEL_SCROLL;
+  new_report.pan = 0;
+
+  usb_hid.sendReport(RID_MOUSE, &new_report, sizeof(new_report));
+  delay(SINGLE_PRESS_DELAY);
+  new_report.wheel = 0;
+  usb_hid.sendReport(RID_MOUSE, &new_report, sizeof(new_report));
+}
 
 void handle_usb_input(uint32_t itf_protocol, uint32_t len, uint8_t* report) {
   if (len == 0) {
@@ -176,12 +196,28 @@ void handle_usb_input(uint32_t itf_protocol, uint32_t len, uint8_t* report) {
       }
     }
 
+    if (scroll_up_last > 0) {
+      unsigned long mark = scroll_up_holding_sent_last > 0 ? scroll_up_holding_sent_last : scroll_up_last;
+      if (millis() - mark > SCROLL_REPEAT_INTERVAL) {
+        mouse_wheel(true);
+        scroll_up_holding_sent_last = millis();
+      }
+    }
+
+    if (scroll_down_last > 0) {
+      unsigned long mark = scroll_down_holding_sent_last > 0 ? scroll_down_holding_sent_last : scroll_down_last;
+      if (millis() - mark > SCROLL_REPEAT_INTERVAL) {
+        mouse_wheel(false);
+        scroll_down_holding_sent_last = millis();
+      }
+    }
+
     return;
   }
 
   if (itf_protocol == HID_ITF_PROTOCOL_KEYBOARD) {
     bool shift = (report[0] & 2) != 0;
-    
+
     // Check for the first non-zero scan code
     uint8_t scan_code = report[2];
     if (scan_code == 0) { scan_code = report[3]; }
@@ -206,6 +242,24 @@ void handle_usb_input(uint32_t itf_protocol, uint32_t len, uint8_t* report) {
         lower_left_button_last = 0;
       }
 
+      if (scroll_up_last > 0) {
+        scroll_up_last = 0;
+        if (scroll_up_holding_sent_last == 0) {
+          mouse_wheel(true);
+        } else {
+          scroll_up_holding_sent_last = 0;
+        }
+      }
+
+      if (scroll_down_last > 0) {
+        scroll_down_last = 0;
+        if (scroll_down_holding_sent_last == 0) {
+          mouse_wheel(false);
+        } else {
+          scroll_down_holding_sent_last = 0;
+        }
+      }
+
       // Don't check passthru; always allow a key release report through, to prevent stuck keys
       if (usb_hid.ready()) {
         usb_hid.sendReport(RID_KEYBOARD, report, sizeof(hid_keyboard_report_t));
@@ -228,7 +282,13 @@ void handle_usb_input(uint32_t itf_protocol, uint32_t len, uint8_t* report) {
       }
 
       if (isPassthru()) {
-        usb_hid.sendReport(RID_KEYBOARD, report, sizeof(hid_keyboard_report_t));
+        if (scan_code == HID_KEY_ARROW_DOWN) {
+          scroll_down_last = millis();
+        } else if (scan_code == HID_KEY_ARROW_UP) {
+          scroll_up_last = millis();
+        } else {
+          usb_hid.sendReport(RID_KEYBOARD, report, sizeof(hid_keyboard_report_t));
+        }
       }
     }
   } else if (report[0] == 0x04) {
@@ -254,7 +314,7 @@ void handle_usb_input(uint32_t itf_protocol, uint32_t len, uint8_t* report) {
     }
     ok_button_pressed = report[1] > 0;
   } else if (report[0] == 0x01) {
-    // Consumer events
+    // Consumer events`
     if (report[1] == 0x00) {
       // Consumer release
       if (mouse_button_last > 0) {
