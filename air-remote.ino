@@ -1,5 +1,5 @@
 #include <Wire.h>
-#include <CircularBuffer.h>
+#include <CircularBuffer.hpp>
 
 #include "usb.h"
 
@@ -15,6 +15,7 @@ enum
   RID_KEYBOARD = 1,
   RID_MOUSE,
   RID_CONSUMER_CONTROL,
+  RID_GAMEPAD
 };
 
 uint8_t const desc_hid_report[] =
@@ -24,7 +25,14 @@ uint8_t const desc_hid_report[] =
   TUD_HID_REPORT_DESC_CONSUMER( HID_REPORT_ID(RID_CONSUMER_CONTROL) ),
 };
 
+uint8_t const desc_hid_report_gamepad[] =
+{
+  TUD_HID_REPORT_DESC_GAMEPAD ( HID_REPORT_ID(RID_GAMEPAD) ),
+};
+
+
 Adafruit_USBD_HID usb_hid;
+Adafruit_USBD_HID usb_hid_gamepad;
 
 bool passthru = true;
 
@@ -73,7 +81,16 @@ void setup() {
   usb_hid.setPollInterval(2);
   usb_hid.setReportDescriptor(desc_hid_report, sizeof(desc_hid_report));
   usb_hid.begin();
+
+  usb_hid_gamepad.setPollInterval(2);
+  usb_hid_gamepad.setReportDescriptor(desc_hid_report_gamepad, sizeof(desc_hid_report_gamepad));
+  usb_hid_gamepad.setStringDescriptor("Bicycle Gamepad");
+  usb_hid_gamepad.begin();
 }
+
+unsigned long last_gamepad_input = 0;
+hid_gamepad_report_t gamepad_report;
+bool gamepad_report_ready = false;
 
 void dataReceived(int numBytes) {
 	while(Wire.available()) {
@@ -85,6 +102,18 @@ void dataReceived(int numBytes) {
     } else if (byte == 'P') {
       // Uppercase P: passthru on
       passthru = true;
+    } else if (byte == 'G') {
+      // Gamepad input
+      gamepad_report.x = Wire.read();
+      gamepad_report.y = Wire.read();
+      gamepad_report.z = Wire.read();
+      gamepad_report.rz = 0;
+      gamepad_report.rx = Wire.read();
+      gamepad_report.ry = Wire.read();
+      gamepad_report.hat = Wire.read();
+      gamepad_report.buttons = Wire.read();
+      last_gamepad_input = millis();
+      gamepad_report_ready = true;
     }
 	}
 }
@@ -116,16 +145,27 @@ void loop() {
     handle_usb_input(0, 0, NULL);
   }
 
-  delay(10);
+  handle_gamepad();
+
+  delay(2);
+}
+
+void handle_gamepad() {
+  if (gamepad_report_ready && usb_hid_gamepad.ready()) {
+    usb_hid_gamepad.sendReport(RID_GAMEPAD, &gamepad_report, sizeof(gamepad_report));
+    gamepad_report_ready = false;
+  }
 }
 
 const char* HID_CHAR_MAP_SHIFT_OFF = "abcdefghijklmnopqrstuvwxyz1234567890" "\x0A\x1B\x08\x09" " -=[]\\" "X" ";'"  "`,./";
 const char* HID_CHAR_MAP_SHIFT_ON  = "ABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()" "\x0A\x1B\x08\x09" " _+{}|"  "X" ":\"" "~<>?";
+unsigned long last_keyboard_activity = 0;
 
 void xfer_key_press(bool shift, uint8_t scan_code) {
   if (scan_code >= HID_KEY_A && scan_code <= HID_KEY_SLASH ) {
     char c = (shift ? HID_CHAR_MAP_SHIFT_ON : HID_CHAR_MAP_SHIFT_OFF)[scan_code - HID_KEY_A];
     input_events.unshift(InputEvent{ .kind = 'A', .data = c});
+    last_keyboard_activity = millis();
   } else {
     input_events.unshift(InputEvent{ .kind = 'K', .data = scan_code});
   }
@@ -144,6 +184,8 @@ unsigned long scroll_up_last = 0;
 unsigned long scroll_up_holding_sent_last = 0;
 unsigned long scroll_down_last = 0;
 unsigned long scroll_down_holding_sent_last = 0;
+uint8_t last_scan_code_pressed = 0;
+unsigned long last_key_release = 0;
 
 const int BUTTON_HOLD_THRESHOLD = 400;
 const int MOUSE_MOVE_THRESHOLD = 180;
@@ -151,6 +193,8 @@ const int VOLUME_SEND_INTERVAL = 80;
 const int SCROLL_REPEAT_INTERVAL = 150;
 const int SINGLE_PRESS_DELAY = 15;
 const int MOUSE_WHEEL_SCROLL = 1;
+const int KEY_DEBOUNCE_INTERVAL = 40;
+const int BACK_KEYBOARD_SAFETY_INTERVAL = 1000;
 
 void mouse_wheel(bool up) {
   if (!isPassthru()) {
@@ -174,14 +218,18 @@ void handle_usb_input(uint32_t itf_protocol, uint32_t len, uint8_t* report) {
   if (len == 0) {
     // Periodic tick check, not actually input
     if (lower_left_button_last > 0 && millis() - lower_left_button_last >= BUTTON_HOLD_THRESHOLD) {
-      input_events.unshift(InputEvent{ .kind = 'C', .data = HID_USAGE_CONSUMER_MENU_ESCAPE});
+      if (millis() - last_keyboard_activity > BACK_KEYBOARD_SAFETY_INTERVAL) {
+        input_events.unshift(InputEvent{ .kind = 'C', .data = HID_USAGE_CONSUMER_MENU_ESCAPE});
+      }
       lower_left_button_last = 0;
     }
 
     if (lower_right_button_last > 0 && millis() - lower_right_button_last >= BUTTON_HOLD_THRESHOLD) {
-      input_events.unshift(InputEvent{ .kind = 'C', .data = HID_USAGE_CONSUMER_MEDIA_SELECT_HOME});
+      if (millis() - last_keyboard_activity > BACK_KEYBOARD_SAFETY_INTERVAL) {
+        input_events.unshift(InputEvent{ .kind = 'C', .data = HID_USAGE_CONSUMER_MEDIA_SELECT_HOME});
+        home_menu_start = millis();
+      }
       lower_right_button_last = 0;
-      home_menu_start = millis();
     }
 
     if (volume_up_last > 0) {
@@ -227,15 +275,17 @@ void handle_usb_input(uint32_t itf_protocol, uint32_t len, uint8_t* report) {
     if (scan_code == 0) { scan_code = report[3]; }
     if (scan_code == 0) { scan_code = report[4]; }
 
+
     if (scan_code == HID_KEY_APPLICATION) {
       // Lower left key
       lower_left_button_last = millis();
     } else if (scan_code == HID_KEY_NONE) {
       // Key release
       key_press_active = false;
+      last_key_release = millis();
 
       if (lower_left_button_last > 0) {
-        if (millis() - lower_left_button_last < BUTTON_HOLD_THRESHOLD) {
+        if (millis() - lower_left_button_last < BUTTON_HOLD_THRESHOLD && millis() - last_keyboard_activity > BACK_KEYBOARD_SAFETY_INTERVAL) {
           input_events.unshift(InputEvent{ .kind = 'C', .data = HID_USAGE_CONSUMER_PLAY_PAUSE});
           if (isPassthru()) {
             usb_hid.sendReport16(RID_CONSUMER_CONTROL, HID_USAGE_CONSUMER_PLAY_PAUSE);
@@ -269,29 +319,35 @@ void handle_usb_input(uint32_t itf_protocol, uint32_t len, uint8_t* report) {
         usb_hid.sendReport(RID_KEYBOARD, report, sizeof(hid_keyboard_report_t));
       }
     } else {
-      // Key press
-      if (!key_press_active) {
-        key_press_active = true;
-        xfer_key_press(shift, scan_code);
+      if (scan_code == last_scan_code_pressed && millis() - last_key_release < KEY_DEBOUNCE_INTERVAL) {
+        Serial.println("DEBOUNCE\n");
+      } else {
+        last_scan_code_pressed = scan_code;
 
-        if (inputs_menu_start > 0) {
-          if (scan_code == HID_KEY_ARROW_DOWN || scan_code == HID_KEY_ARROW_UP) {
-            // Up and down keys reset the inputs menu timeout
-            inputs_menu_start = millis();
-          } else if (scan_code == HID_KEY_ARROW_LEFT || scan_code == HID_KEY_ARROW_RIGHT) {
-            // Left and right keys close the input menu
-            inputs_menu_start = 0;
+        // Key press
+        if (!key_press_active) {
+          key_press_active = true;
+          xfer_key_press(shift, scan_code);
+
+          if (inputs_menu_start > 0) {
+            if (scan_code == HID_KEY_ARROW_DOWN || scan_code == HID_KEY_ARROW_UP) {
+              // Up and down keys reset the inputs menu timeout
+              inputs_menu_start = millis();
+            } else if (scan_code == HID_KEY_ARROW_LEFT || scan_code == HID_KEY_ARROW_RIGHT) {
+              // Left and right keys close the input menu
+              inputs_menu_start = 0;
+            }
           }
         }
-      }
 
-      if (isPassthru()) {
-        if (scan_code == HID_KEY_ARROW_DOWN) {
-          scroll_down_last = millis();
-        } else if (scan_code == HID_KEY_ARROW_UP) {
-          scroll_up_last = millis();
-        } else {
-          usb_hid.sendReport(RID_KEYBOARD, report, sizeof(hid_keyboard_report_t));
+        if (isPassthru()) {
+          if (scan_code == HID_KEY_ARROW_DOWN) {
+            scroll_down_last = millis();
+          } else if (scan_code == HID_KEY_ARROW_UP) {
+            scroll_up_last = millis();
+          } else {
+            usb_hid.sendReport(RID_KEYBOARD, report, sizeof(hid_keyboard_report_t));
+          }
         }
       }
     }
@@ -342,7 +398,7 @@ void handle_usb_input(uint32_t itf_protocol, uint32_t len, uint8_t* report) {
         lower_right_button_last = 0;
       } else {
         if (lower_right_button_last > 0) {
-          if (millis() - lower_right_button_last < BUTTON_HOLD_THRESHOLD) {
+          if (millis() - lower_right_button_last < BUTTON_HOLD_THRESHOLD && millis() - last_keyboard_activity > BACK_KEYBOARD_SAFETY_INTERVAL) {
             input_events.unshift(InputEvent{ .kind = 'C', .data = HID_USAGE_CONSUMER_CHANNEL});
             if (inputs_menu_start == 0) {
               inputs_menu_start = millis();
