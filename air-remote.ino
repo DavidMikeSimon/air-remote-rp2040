@@ -107,11 +107,11 @@ void dataReceived(int numBytes) {
       gamepad_report.x = Wire.read();
       gamepad_report.y = Wire.read();
       gamepad_report.z = Wire.read();
-      gamepad_report.rz = 0;
       gamepad_report.rx = Wire.read();
       gamepad_report.ry = Wire.read();
+      gamepad_report.rz = Wire.read();
       gamepad_report.hat = Wire.read();
-      gamepad_report.buttons = Wire.read();
+      gamepad_report.buttons = (Wire.read() << 8) | Wire.read();
       last_gamepad_input = millis();
       gamepad_report_ready = true;
     }
