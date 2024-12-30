@@ -2,6 +2,7 @@
 #include <CircularBuffer.hpp>
 
 #include "usb.h"
+// #include "xinput.h"
 
 // Some keys that aren't defined in hid.h
 #define HID_USAGE_CONSUMER_MENU_ESCAPE 0x46
@@ -48,6 +49,13 @@ struct InputEvent {
 };
 
 CircularBuffer<InputEvent, 16> input_events;
+
+/*
+usbd_class_driver_t const *usbd_app_driver_get_cb(uint8_t *driver_count) {
+    *driver_count = 1;
+    return &xinput_driver;
+}
+*/
 
 bool isPassthru() {
   if (inputs_menu_start != 0) {
@@ -102,6 +110,9 @@ void dataReceived(int numBytes) {
     } else if (byte == 'P') {
       // Uppercase P: passthru on
       passthru = true;
+    } else if (byte == 'R') {
+      // Wake suspended host
+      TinyUSBDevice.remoteWakeup();
     } else if (byte == 'G') {
       // Gamepad input
       gamepad_report.x = Wire.read();
@@ -147,6 +158,8 @@ void loop() {
 
   handle_gamepad();
 
+  xfer_usb_readiness();
+
   delay(2);
 }
 
@@ -154,6 +167,24 @@ void handle_gamepad() {
   if (gamepad_report_ready && usb_hid_gamepad.ready()) {
     usb_hid_gamepad.sendReport(RID_GAMEPAD, &gamepad_report, sizeof(gamepad_report));
     gamepad_report_ready = false;
+  }
+}
+
+char most_recent_usb_readiness_code_recorded = 0;
+char most_recent_usb_readiness_code_sent = 0;
+unsigned long last_usb_readiness_change = 0;
+
+void xfer_usb_readiness() {
+  unsigned long now = millis();
+  bool readiness = usb_hid.ready();
+  char readiness_code = readiness ? 'Y' : 'N';
+  if (readiness_code != most_recent_usb_readiness_code_recorded) {
+    most_recent_usb_readiness_code_recorded = readiness_code;
+    last_usb_readiness_change = now;
+  }
+  if (most_recent_usb_readiness_code_sent != readiness_code && now - last_usb_readiness_change > 50) {
+    input_events.unshift(InputEvent{ .kind = 'U', .data = readiness_code });
+    most_recent_usb_readiness_code_sent = readiness_code;
   }
 }
 
